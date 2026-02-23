@@ -213,7 +213,7 @@ def populate_dataset(
 
             for i in range(num_frames):
                 frame = {
-                    # 'task': task,
+                    'task': task,
                     "observation.state": states[i],
                     "action": actions[i],
                 }
