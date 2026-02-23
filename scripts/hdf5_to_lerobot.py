@@ -42,32 +42,40 @@ def create_empty_dataset(
 ) -> LeRobotDataset:
     states = []
     actions = []
-    for i in range(len(args.armJointStateNames)):
-        if "puppet" in args.armJointStateNames[i]:
-            for j in range(args.armJointStateDims[i]):
-                states += [f'arm.jointStatePosition.{args.armJointStateNames[i]}.joint{j}']
-        if "master" in args.armJointStateNames[i]:
-            for j in range(args.armJointStateDims[i]):
-                actions += [f'arm.jointStatePosition.{args.armJointStateNames[i]}.joint{j}']
+    
+    # --- PIKA LOGIC (7D State & Action) ---
+    if not args.armJointStateNames and not args.armEndPoseNames:
+        states = ['x', 'y', 'z', 'roll', 'pitch', 'yaw', 'gripper']
+        actions = states.copy()
+    
+    # --- ORIGINAL ALOHA LOGIC ---
+    else:
+        for i in range(len(args.armJointStateNames)):
+            if "puppet" in args.armJointStateNames[i]:
+                for j in range(args.armJointStateDims[i]):
+                    states += [f'arm.jointStatePosition.{args.armJointStateNames[i]}.joint{j}']
+            if "master" in args.armJointStateNames[i]:
+                for j in range(args.armJointStateDims[i]):
+                    actions += [f'arm.jointStatePosition.{args.armJointStateNames[i]}.joint{j}']
 
-    for i in range(len(args.armEndPoseNames)):
-        if "puppet" in args.armEndPoseNames[i]:
-            for j in range(args.armEndPoseDims[i]):
-                states += [f'arm.endPose.{args.armEndPoseNames[i]}.joint{j}']
-        if "master" in args.armEndPoseNames[i]:
-            for j in range(args.armEndPoseDims[i]):
-                actions += [f'arm.endPose.{args.armEndPoseNames[i]}.joint{j}']
+        for i in range(len(args.armEndPoseNames)):
+            if "puppet" in args.armEndPoseNames[i]:
+                for j in range(args.armEndPoseDims[i]):
+                    states += [f'arm.endPose.{args.armEndPoseNames[i]}.joint{j}']
+            if "master" in args.armEndPoseNames[i]:
+                for j in range(args.armEndPoseDims[i]):
+                    actions += [f'arm.endPose.{args.armEndPoseNames[i]}.joint{j}']
 
     features = {
         "observation.state": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (len(states),),
             "names": [
                 states,
             ],
         },
         "action": {
-            "dtype": "float64",
+            "dtype": "float32",
             "shape": (len(actions),),
             "names": [
                 actions,
@@ -124,18 +132,39 @@ def load_episode_data(
 ):
     with h5py.File(episode_path, "r") as episode:
         try:
-            states = torch.from_numpy(
-                np.concatenate(
-                    [episode[f"arm/jointStatePosition/{name}"][()] for name in args.armJointStateNames if "puppet" in name] + \
-                    [episode[f"arm/endPose/{name}"][()] for name in args.armEndPoseNames if "puppet" in name], axis=1
-                )
-            )
-            actions = torch.from_numpy(
-                np.concatenate(
-                    [episode[f"arm/jointStatePosition/{name}"][()] for name in args.armJointStateNames if "master" in name] + \
-                    [episode[f"arm/endPose/{name}"][()] for name in args.armEndPoseNames if "master" in name], axis=1
-                )
-            )
+            # --- PIKA LOGIC (Load 6D Pose + 1D Gripper) ---
+            if not args.armJointStateNames and not args.armEndPoseNames:
+                # Shape: (N, 6)
+                pose_data = episode[f"localization/pose/{args.localizationPoseNames[0]}"][()]
+                # Shape: (N, 1)
+                gripper_data = episode[f"gripper/encoderAngle/{args.gripperEncoderNames[0]}"][()].reshape(-1, 1)
+                
+                # Combine into (N, 7) array
+                state_array = np.concatenate([pose_data, gripper_data], axis=1)
+                
+                # Convert to float32 tensors for LeRobot
+                states = torch.from_numpy(state_array).float()
+                
+                # Shift action by 1 timestep to create the target for imitation learning
+                actions = states.clone()
+                actions[:-1] = states[1:] 
+                actions[-1] = states[-1]
+
+            # --- ORIGINAL ALOHA LOGIC ---
+            else:
+                states = torch.from_numpy(
+                    np.concatenate(
+                        [episode[f"arm/jointStatePosition/{name}"][()] for name in args.armJointStateNames if "puppet" in name] + \
+                        [episode[f"arm/endPose/{name}"][()] for name in args.armEndPoseNames if "puppet" in name], axis=1
+                    )
+                ).float()
+                actions = torch.from_numpy(
+                    np.concatenate(
+                        [episode[f"arm/jointStatePosition/{name}"][()] for name in args.armJointStateNames if "master" in name] + \
+                        [episode[f"arm/endPose/{name}"][()] for name in args.armEndPoseNames if "master" in name], axis=1
+                    )
+                ).float()
+
             colors = {}
             for camera in args.cameraColorNames:
                 colors[camera] = []
@@ -159,7 +188,12 @@ def load_episode_data(
                         pointclouds[camera].append(np.load(
                             os.path.join(str(episode_path.resolve())[:-9], episode[f'camera/color/{camera}'][i].decode('utf-8'))))
             return colors, depths, pointclouds, states, actions
-        except:
+        
+        except Exception as e:
+            print(f"\n[ERROR] Failed on {episode_path}")
+            print(f"Details: {repr(e)}")
+            import traceback
+            traceback.print_exc()
             return None, None, None, None, None
 
 def populate_dataset(
@@ -196,7 +230,11 @@ def populate_dataset(
             dataset.save_episode()
         else:
             error_file.append(episode_path)
-    print("error:", error_file)
+            
+    if error_file:
+        print(f"\nCompleted with errors in {len(error_file)} files:")
+        for ef in error_file:
+            print(f" - {ef}")
     return dataset
 
 
@@ -229,6 +267,12 @@ def process(
 
 
 def get_arguments():
+    # Helper to fix the argparse boolean trap
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        return str(v).lower() in ("yes", "true", "t", "1")
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--datasetDir', action='store', type=str, help='datasetDir',
                         default="/home/agilex/data", required=False)
@@ -250,7 +294,7 @@ def get_arguments():
                         default=[], required=False)
     parser.add_argument('--cameraPointCloudNames', action='store', type=str, help='cameraPointCloudNames',
                         default=[], required=False)
-    parser.add_argument('--useCameraPointCloud', action='store', type=bool, help='useCameraPointCloud',
+    parser.add_argument('--useCameraPointCloud', action='store', type=str2bool, help='useCameraPointCloud',
                         default=False, required=False)
     parser.add_argument('--pointNum', action='store', type=int, help='point_num',
                         default=5000, required=False)
