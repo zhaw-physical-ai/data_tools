@@ -224,7 +224,7 @@ def populate_dataset(
                 if args.useCameraPointCloud:
                     for camera, pointcloud in pointclouds.items():
                         frame[f"observation.pointClouds.{camera}"] = pointcloud[i]
-                dataset.add_frame(frame, task)
+                dataset.add_frame(frame)
                 frame = None
 
             dataset.save_episode()
